@@ -1,0 +1,167 @@
+---
+title: "Processing of Cel-Seq2 Sequencing Data with Scruff"
+author: "Conor Shea"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+params:
+  project: project
+  experiment: experiment
+  lane: lane
+  read1Path: read1Path
+  read2Path: read2Path
+  cores: cores
+  output_dir: output_dir
+  showSetup: showSetup
+  showSession: showSession
+output: 
+ pdf_document:
+     toc: true
+     toc_depth: 2
+     number_sections: false
+---
+
+
+# Scruff Quality Control Plots
+
+```{r setup, include = FALSE}
+suppressPackageStartupMessages(require(Biostrings))
+suppressPackageStartupMessages(require(scruff))
+suppressPackageStartupMessages(require(Rsubread))
+suppressPackageStartupMessages(require(knitr))
+suppressPackageStartupMessages(require(readxl))
+suppressPackageStartupMessages(require(SingleCellExperiment))
+
+project <- params$project
+experiment <- params$experiment
+if(any(grep(".",project,fixed = TRUE),
+       grep(".",experiment,fixed = TRUE),
+       any(duplicated(experiment)))) {
+  stop("You cannot have periods in either the project or experiment names, and the experiment names must be unique.  Please check your inputs before continuing.")
+}
+
+lane <- params$lane
+cores <- params$cores
+if(length(unique(lane)) < cores) {
+  stop("Sending more than one experiment with the same lane to a single core will result in an error.")
+}
+if(cores > 4) {
+  warning("This script often fails with more than 4 cores.")
+}
+
+read1Path <- params$read1Path
+read2Path <- params$read2Path
+if(any(length(unique(read1Path)) != length(experiment),
+       length(unique(read2Path)) != length(experiment),
+       !all(read1Path == gsub("_R2_","_R1_",read2Path)))) {
+  stop("Your FASTQ files must be matched with their respective experiments AND must be paired as reads.")
+}
+
+bc <- as.character(read.table("/restricted/projectnb/pcga/Conor/references/cell_barcodes.txt")[,2])
+bcStart <- 6
+bcStop <- 11
+bcEdit <- 1
+umiStart <- 1
+umiStop <- 5
+keep <- 65
+
+index <- "/restricted/projectnb/cbmhive/references/Homo_Sapiens/GRCh38/Rsubread_GENCODE_index/GENCODE_ERCC"
+gtf <- "/restricted/projectnb/cbmhive/references/Homo_Sapiens/GRCh38/gtf/gencode.v34.annotation.single_PAR_ercc.gtf"
+
+# It is unclear from previous batches which well is the empty well.  Thus, the four corners of the plate
+# are represented in the following manner: [Row A-H as an integer, %01d][Column 1-12, %02d]
+rows <- c("A" = 1, "H" = 8)
+columns <- c("1" = 1, "12" = 12)
+cellPerWell <- rep(1,96)
+cellPerWell[1] <- 100*rows["A"] + columns["1"] #A1
+cellPerWell[12] <- 100*rows["A"] + columns["12"] #A12
+cellPerWell[85] <- 100*rows["H"] + columns["1"] #H1
+cellPerWell[96] <- 100*rows["H"] + columns["12"] #H12
+cellPerWell <- rep(cellPerWell, times = length(unique(experiment)))
+
+dev <- "pdf"
+knitr::opts_chunk$set(
+  echo = FALSE,
+  cache = FALSE,
+  cache.lazy = FALSE,
+  cache.comments = FALSE,
+  fig.align = "center",
+  fig.keep = "all",
+  dev = dev,
+  root.dir = output_dir
+)
+```
+
+```{r demultiplex, cache = TRUE, cache.path = "cache/", echo = FALSE, results = 'hide', message = FALSE, warning = FALSE}
+if(!file.exists("de.rds")) {
+  de <- demultiplex(project = project,
+                    experiment = experiment,
+                    lane = lane,
+                    read1Path = read1Path,
+                    read2Path = read2Path,
+                    bc = bc,
+                    bcStart = bcStart,
+                    bcStop = bcStop,
+                    bcEdit = bcEdit,
+                    umiStart = umiStart,
+                    umiStop = umiStop,
+                    keep = keep,
+                    minQual = 10,
+                    yieldReads = 1e+06,
+                    verbose = TRUE,
+                    overwrite = FALSE,
+                    cores = cores)
+  saveRDS(de,"de.rds")
+} else {
+  de <- readRDS("de.rds")
+}
+```
+
+
+```{r alignRsubread, cache = TRUE, cache.path = "cache/", echo = FALSE, results = 'hide', message = FALSE, warning = FALSE}
+if(!file.exists("al.rds")) {
+  al <- alignRsubread(de,
+                    index = index,
+                    unique = FALSE,
+                    nBestLocations = 1,
+                    format = "BAM",
+                    overwrite = FALSE,
+                    verbose = TRUE,
+                    cores = cores)
+  saveRDS(al, "al.rds")
+} else {
+  al <- readRDS("al.rds")
+}
+```
+
+
+```{r count, cache = TRUE, cache.path = "cache/", echo = FALSE, results = 'hide', message = FALSE, warning = FALSE}
+if(!any(grepl("scruff_object_final", list.files(getwd())))) {
+  sce <- countUMI(al,
+                  reference = gtf,
+                  umiEdit = 0,
+                  format = "BAM",
+                  cellPerWell = cellPerWell,
+                  verbose = TRUE,
+                  cores = cores)
+
+  # Recalculate mitochondrial counts
+  mt_genome <- grep("M", SummarizedExperiment::rowData(sce)[, "seqid"], ignore.case = TRUE)
+  mt_proteincoding <- intersect(mt_genome, which(rowData(sce)$gene_biotype == "protein_coding"))
+  mt_genes <- rowData(sce)$gene_id[mt_proteincoding]
+  sce$mt_counts  <- base::colSums(as.data.frame(counts(sce)[mt_genes, ]))
+
+  filename <- paste0("scruff_object_final_", format(Sys.time(), "%m%d%Y"), ".rds")
+  saveRDS(sce, filename)
+} else {
+  filename <- grep("scruff_object_final", list.files(getwd()), value = TRUE)
+  sce <- readRDS(filename)
+}
+```
+
+The **qcplots()** function plots the sequencing statistics derived during the demultiplexing, alignment,
+and counting steps.  The full list of plots are found here: https://github.com/campbio/scruff/blob/master/R/qcplots.R
+
+```{r qcplots, echo = FALSE, fig.height = 9, fig.width = 9}
+g <- qcplots(sce)
+print(g)
+```
+
